@@ -66,6 +66,8 @@ logger = init_logger(__name__)
 
 
 class SpecDecodeBaseProposer:
+    HAS_CROSS_MODEL_KV_SHARING: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,

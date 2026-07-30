@@ -30,6 +30,8 @@ logger = init_logger(__name__)
 
 
 class Gemma4Proposer(SpecDecodeBaseProposer):
+    HAS_CROSS_MODEL_KV_SHARING: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
