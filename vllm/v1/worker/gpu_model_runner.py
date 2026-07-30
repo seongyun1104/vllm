@@ -207,7 +207,10 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
-from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm.v1.spec_decode.utils import (
+    should_skip_drafter_forward,
+    update_num_computed_tokens_for_batch_change,
+)
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -5025,6 +5028,18 @@ class GPUModelRunner(
         num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        if should_skip_drafter_forward(
+            num_spec_tokens_to_schedule,
+            self.parallel_config.data_parallel_size,
+            self.drafter,
+        ):
+            self.drafter.clear_last_draft_probs()
+            return torch.empty(
+                common_attn_metadata.batch_size(),
+                0,
+                device=sample_hidden_states.device,
+                dtype=torch.int64,
+            )
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 

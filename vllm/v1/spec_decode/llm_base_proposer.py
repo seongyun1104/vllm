@@ -501,6 +501,9 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def clear_last_draft_probs(self) -> None:
+        self._last_draft_probs = None
+
     def propose(
         self,
         num_speculative_tokens,

@@ -25,6 +25,36 @@ def next_power_of_2(n: int) -> int:
     return n + 1
 
 
+def should_skip_drafter_forward(
+    num_spec_tokens_to_schedule: int,
+    data_parallel_size: int,
+    drafter: object,
+) -> bool:
+    """K=0 fast-path predicate: True when the drafter forward can be skipped.
+
+    Preconditions:
+      (a) Dynamic SD selected K=0 for this step's batch tier.
+      (b) data_parallel_size == 1. Dynamic SD is disabled under DP>1 by
+          vllm/config/vllm.py::_maybe_disable_dynamic_sd_for_data_parallel;
+          if that gate is later relaxed (see issue #49986), callers must
+          add a drafter.dummy_run(1) branch here to avoid collective hangs,
+          AND refresh drafter.num_speculative_tokens — dummy_run reads
+          that attribute for its forward-pass count, so a stale K would
+          diverge dummy pass counts across DP ranks.
+      (c) The drafter shares its KV cache read-only with the target model
+          (advertised via HAS_CROSS_MODEL_KV_SHARING). The target's forward
+          has already updated the shared KV, so a drafter forward at K=0
+          would only rebuild attention metadata and re-run the model to
+          discard its output. getattr with a False default keeps this
+          predicate compatible with drafters that do not define the flag.
+    """
+    return (
+        num_spec_tokens_to_schedule == 0
+        and data_parallel_size == 1
+        and getattr(drafter, "HAS_CROSS_MODEL_KV_SHARING", False)
+    )
+
+
 @triton.jit
 def eagle_step_slot_mapping_metadata_kernel(
     positions_ptr,  # [batch_size] - current positions (1D view for M-RoPE)
