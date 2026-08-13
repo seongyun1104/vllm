@@ -1524,6 +1524,24 @@ class SpeculativeConfig:
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.speculative_token_schedule is not None
 
+    def enumerable_effective_k_set(self) -> set[int] | None:
+        """Return the distinct effective K a dynamic schedule can emit.
+
+        K is the last element of every entry for both the 3-item and 5-item
+        (context-aware) forms, so ``entry[-1]`` reads it without misreading
+        ``ctx_lo``. Values are clamped to ``num_speculative_tokens``. Returns
+        ``None`` when there is no usable schedule; a single-element set is the
+        constant-K case that keeps full CUDA graphs.
+        """
+        schedule = self.speculative_token_schedule
+        if not schedule:
+            return None
+        max_k = self.num_speculative_tokens
+        try:
+            return {min(int(entry[-1]), max_k) for entry in schedule}
+        except (TypeError, ValueError, IndexError):
+            return None
+
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
 

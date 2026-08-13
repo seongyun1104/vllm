@@ -151,6 +151,50 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
             assert desc.num_active_loras == 0
 
 
+def test_dynamic_sd_ctx_schedule_captures_effective_k_not_ctx_lo(monkeypatch):
+    """A 5-item ``(bs x ctx)`` schedule must capture FULL decode graphs keyed on
+    the effective K per context bucket, not on ``ctx_lo``.
+
+    Regression guard for the index-2 gap: ``_init_candidates`` reads ``x[2]`` from
+    the raw ``speculative_token_schedule``, which is K only for 3-item entries;
+    for 5-item entries ``x[2]`` is ``ctx_lo``. Here K in {5, 2} over two context
+    buckets, so the captured uniform decode query lengths must be {6, 3}. The
+    buggy path derives them from ctx_lo {1, 2001} -> {2, 2002} instead.
+    """
+
+    max_num_seqs = 512
+    max_spec_tokens = 5
+    max_decode_query_len = max_spec_tokens + 1
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    schedule = [
+        (1, max_num_seqs, 1, 2000, 5),
+        (1, max_num_seqs, 2001, 2**31 - 1, 2),
+    ]
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        num_spec_per_batch_size=schedule,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=max_decode_query_len,
+    )
+
+    full_query_lens = {
+        desc.uniform_token_count
+        for desc in manager._capture_descs[CUDAGraphMode.FULL]
+    }
+    assert full_query_lens == {3, 6}
+
+
 def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
     """DSD should use PIECEWISE when the batch is not a uniform decode batch.
 

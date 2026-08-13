@@ -198,20 +198,17 @@ class CudaGraphManager:
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
         ):
-            num_spec_per_batch_size = (
-                speculative_config.speculative_token_schedule
-            )
-            # uses_dynamic_speculative_decoding() guarantees this is set.
-            assert num_spec_per_batch_size is not None
-            # decode_query_len = num_speculative_steps + num_new_sampled_tokens
-            # _per_step. Recover num_new_sampled_tokens_per_step
-            # from the values the manager already has.
+            schedule = speculative_config.speculative_token_schedule
+            assert schedule is not None
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
-            # Each entry is (range_start, range_end, num_speculative_tokens).
+            # K is the last item of each entry (3- and 5-item forms); a positional
+            # index would misread ctx_lo as K for 5-item context-aware schedules.
+            max_k = self.vllm_config.num_speculative_tokens
+            effective_ks = {min(int(entry[-1]), max_k) for entry in schedule}
             decode_query_lens = [
-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
+                k + num_new_sampled_tokens_per_step for k in sorted(effective_ks)
             ]
         else:
             decode_query_lens = [self.decode_query_len]

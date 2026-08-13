@@ -68,6 +68,29 @@ def _add_requests_and_schedule(
     return scheduler.schedule()
 
 
+def test_enumerable_effective_k_set_reads_last_element():
+    config = _make_scheduler_with_dynamic_sd(
+        [(1, 16, 5)],
+        runtime_num_speculative_tokens=5,
+    ).vllm_config.speculative_config
+    assert config is not None
+
+    config.speculative_token_schedule = [(1, 16, 3), (32, 64, 1)]
+    assert config.enumerable_effective_k_set() == {3, 1}
+
+    config.speculative_token_schedule = [
+        (1, 16, 1, 2000, 5),
+        (1, 16, 2001, 2**31 - 1, 2),
+    ]
+    assert config.enumerable_effective_k_set() == {5, 2}
+
+    config.speculative_token_schedule = [(1, 16, 2), (32, 64, 2)]
+    assert config.enumerable_effective_k_set() == {2}
+
+    config.speculative_token_schedule = None
+    assert config.enumerable_effective_k_set() is None
+
+
 def test_dynamic_sd_uses_batch_size_schedule():
     dynamic_sd_lookup = _make_lookup(
         [
