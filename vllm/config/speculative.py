@@ -494,6 +494,22 @@ class SpeculativeConfig:
     """Aggregation across decode requests' num_computed_tokens used to pick
     the ctx bucket for 5-item schedules."""
 
+    spec_schedule_mode: Literal["manual", "derive"] = "manual"
+    """How ``speculative_token_schedule`` is produced. ``manual`` (default) uses
+    the list supplied above. ``derive`` generates it from ``spec_cost_model``
+    via ``vllm.v1.spec_decode.dynamic.cost_model``; the two are mutually
+    exclusive."""
+
+    spec_cost_model: dict[str, Any] | None = None
+    """Cost-model inputs used when ``spec_schedule_mode='derive'``. Keys:
+    ``acceptance`` (float prior in ``(0, 1)``, or ``{"prior": float}`` for
+    forward compatibility), ``bs_tiers`` (list of ``[bs_lo, bs_hi]``, first
+    starting at 1), ``ctx_grid`` (ascending context points), ``capture_budget``
+    (optional distinct-K ceiling), and optional coefficient overrides
+    ``verify_fixed_base``, ``verify_fixed_per_ctx``, ``draft_marginal_base``,
+    ``draft_marginal_per_bs``. Coefficient defaults are design-time references
+    and should be calibrated on hardware before any speedup is claimed."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -562,6 +578,20 @@ class SpeculativeConfig:
         )[:n]
 
     @staticmethod
+    def _validate_acceptance_vector(
+        rates: list[float], n: int, name: str
+    ) -> list[float]:
+        """Validate a per-position acceptance vector (length ``n``, each entry
+        in ``[0, 1]``, monotonically non-increasing) and return a copy."""
+        if len(rates) != n:
+            raise ValueError(f"{name} must have length {n}, got {rates}.")
+        if not all(0.0 <= r <= 1.0 for r in rates):
+            raise ValueError(f"{name} entries must be in [0, 1], got {rates}.")
+        if any(rates[i] > rates[i - 1] for i in range(1, n)):
+            raise ValueError(f"{name} must be non-increasing, got {rates}.")
+        return list(rates)
+
+    @staticmethod
     def _resolve_synthetic_acceptance_rates(
         n: int,
         rates: list[float] | None,
@@ -575,26 +605,67 @@ class SpeculativeConfig:
                 "synthetic_acceptance_rates or synthetic_acceptance_length."
             )
         if rates is not None:
-            if len(rates) != n:
-                raise ValueError(
-                    f"synthetic_acceptance_rates must have length {n}, got {rates}."
-                )
-            if not all(0.0 <= r <= 1.0 for r in rates):
-                raise ValueError(
-                    f"synthetic_acceptance_rates entries must be in [0, 1], "
-                    f"got {rates}."
-                )
-            if any(rates[i] > rates[i - 1] for i in range(1, n)):
-                raise ValueError(
-                    f"synthetic_acceptance_rates must be non-increasing, got {rates}."
-                )
-            return list(rates)
+            return SpeculativeConfig._validate_acceptance_vector(
+                rates, n, "synthetic_acceptance_rates"
+            )
         assert length is not None
         if not 1.0 <= length <= float(n + 1):
             raise ValueError(
                 f"synthetic_acceptance_length must be in [1, {n + 1}], got {length}."
             )
         return SpeculativeConfig._acceptance_length_to_rates(length, n)
+
+    def _derive_schedule(self) -> list[tuple[int, int, int, int, int]]:
+        """Produce ``speculative_token_schedule`` from ``spec_cost_model``.
+
+        Requires ``spec_schedule_mode='derive'`` and no manually supplied
+        schedule (the two are mutually exclusive).
+        """
+        from vllm.v1.spec_decode.dynamic.cost_model import (
+            CostModelParams,
+            derive_dynamic_sd_schedule,
+        )
+
+        if self.speculative_token_schedule is not None:
+            raise ValueError(
+                "spec_schedule_mode='derive' generates "
+                "speculative_token_schedule; do not also set it manually."
+            )
+        if self.spec_cost_model is None:
+            raise ValueError(
+                "spec_schedule_mode='derive' requires spec_cost_model."
+            )
+
+        cm = dict(self.spec_cost_model)
+        acceptance = cm.pop("acceptance", None)
+        if acceptance is None:
+            raise ValueError("spec_cost_model requires 'acceptance'.")
+        if isinstance(acceptance, dict):
+            # ``self_correct_after_n_steps`` is a Layer-B knob, unused here.
+            acceptance = acceptance["prior"]
+        try:
+            bs_tiers = [tuple(t) for t in cm.pop("bs_tiers")]
+            ctx_grid = list(cm.pop("ctx_grid"))
+        except KeyError as exc:
+            raise ValueError(f"spec_cost_model missing key: {exc}") from exc
+        capture_budget = cm.pop("capture_budget", None)
+        params = CostModelParams(
+            acceptance=acceptance,
+            verify_fixed_base=cm.pop("verify_fixed_base", 1.0),
+            verify_fixed_per_ctx=cm.pop("verify_fixed_per_ctx", 2.5e-4),
+            draft_marginal_base=cm.pop("draft_marginal_base", 0.2),
+            draft_marginal_per_bs=cm.pop("draft_marginal_per_bs", 0.02),
+        )
+        if cm:
+            raise ValueError(f"spec_cost_model has unknown keys: {sorted(cm)}")
+
+        return derive_dynamic_sd_schedule(
+            params,
+            bs_tiers,
+            ctx_grid,
+            max_k=self.num_speculative_tokens,
+            capture_budget=capture_budget,
+        )
 
     draft_sample_method: DraftSampleMethod = "greedy"
     """How the draft model samples tokens. 'greedy' always picks the argmax
@@ -1710,6 +1781,13 @@ class SpeculativeConfig:
             raise ValueError(
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
+            )
+
+        if self.spec_schedule_mode == "derive":
+            self.speculative_token_schedule = self._derive_schedule()
+        elif self.spec_cost_model is not None:
+            raise ValueError(
+                "spec_cost_model is only used with spec_schedule_mode='derive'."
             )
 
         if self.rejection_sample_method == "synthetic":
