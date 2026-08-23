@@ -6,13 +6,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative import (
+    SpecAcceptancePrior,
+    SpecCostModelConfig,
+    SpeculativeConfig,
+)
 from vllm.v1.spec_decode.dynamic.cost_model import (
     CostModelParams,
     _optimal_k,
     derive_dynamic_sd_schedule,
 )
 from vllm.v1.spec_decode.dynamic.utils import (
+    _CTX_INFINITY,
     build_dynamic_sd_schedule_lookup,
     validate_and_normalize_dynamic_sd_schedule,
 )
@@ -80,6 +85,42 @@ def test_boundaries_are_derived_not_hardcoded():
     assert len({(e[2], e[3]) for e in schedule}) > 1
 
 
+def _ctx_buckets(schedule):
+    return sorted({(e[2], e[3]) for e in schedule})
+
+
+def _ks_at(schedule, bucket):
+    return tuple(e[4] for e in schedule if (e[2], e[3]) == bucket)
+
+
+def test_no_boundary_survives_that_separates_nothing():
+    # Budget coarsening can equalise K across a boundary that was justified
+    # before the merge. Such a boundary costs a bucket and misreads as a K*
+    # transition, so it must not survive.
+    for budget in (None, 1, 2, 3, 4, 5):
+        schedule = derive_dynamic_sd_schedule(
+            _PARAMS, _BS_TIERS, _CTX_GRID, max_k=5, capture_budget=budget
+        )
+        buckets = _ctx_buckets(schedule)
+        for lower, upper in zip(buckets, buckets[1:]):
+            assert _ks_at(schedule, lower) != _ks_at(schedule, upper), (
+                f"inert ctx boundary at {upper[0]} (capture_budget={budget})"
+            )
+
+
+def test_bucket_ranges_stay_contiguous_after_merging():
+    schedule = derive_dynamic_sd_schedule(
+        _PARAMS, _BS_TIERS, _CTX_GRID, max_k=5, capture_budget=3
+    )
+    buckets = _ctx_buckets(schedule)
+    assert buckets[0][0] == 1
+    assert buckets[-1][1] == _CTX_INFINITY
+    for lower, upper in zip(buckets, buckets[1:]):
+        assert lower[1] + 1 == upper[0]
+    # The grid stays rectangular: every tier is present in every bucket.
+    assert len(schedule) == len(_BS_TIERS) * len(buckets)
+
+
 def test_capture_budget_clamps_distinct_k():
     for budget in (1, 2, 3):
         schedule = derive_dynamic_sd_schedule(
@@ -122,16 +163,22 @@ def test_derive_rejects_non_rectangular_or_bad_tiers():
         )
 
 
+def _cost_model(**overrides) -> SpecCostModelConfig:
+    base = dict(
+        acceptance=0.6,
+        bs_tiers=[(1, 16), (17, 64)],
+        ctx_grid=[4000, 8000, 16000, 32000],
+        capture_budget=4,
+    )
+    base.update(overrides)
+    return SpecCostModelConfig(**base)
+
+
 def _derive_self(**overrides):
     base = dict(
         spec_schedule_mode="derive",
         speculative_token_schedule=None,
-        spec_cost_model={
-            "acceptance": 0.6,
-            "bs_tiers": [[1, 16], [17, 64]],
-            "ctx_grid": [4000, 8000, 16000, 32000],
-            "capture_budget": 4,
-        },
+        spec_cost_model=_cost_model(),
         num_speculative_tokens=5,
     )
     base.update(overrides)
@@ -144,16 +191,33 @@ def test_derive_mode_populates_schedule():
     validate_and_normalize_dynamic_sd_schedule(schedule)
 
 
-def test_derive_mode_forward_compat_acceptance_dict():
-    obj = _derive_self(
-        spec_cost_model={
-            "acceptance": {"prior": 0.6, "self_correct_after_n_steps": 0},
-            "bs_tiers": [[1, 64]],
-            "ctx_grid": [4000, 32000],
-        }
+def test_scalar_acceptance_is_widened_to_prior():
+    # The scalar form stays valid and lands on the same typed field the
+    # mapping form produces.
+    scalar = _cost_model(acceptance=0.6)
+    mapping = _cost_model(
+        acceptance={"prior": 0.6, "self_correct_after_n_steps": 0}
     )
-    schedule = SpeculativeConfig._derive_schedule(obj)
-    assert all(len(e) == 5 for e in schedule)
+    assert isinstance(scalar.acceptance, SpecAcceptancePrior)
+    assert scalar.acceptance.prior == mapping.acceptance.prior
+    assert SpeculativeConfig._derive_schedule(
+        _derive_self(spec_cost_model=scalar)
+    ) == SpeculativeConfig._derive_schedule(
+        _derive_self(spec_cost_model=mapping)
+    )
+
+
+def test_self_correct_knob_does_not_change_the_derived_schedule():
+    # Reserved Layer-B knob: accepted by the schema, inert in the derivation.
+    without = SpeculativeConfig._derive_schedule(_derive_self())
+    with_knob = SpeculativeConfig._derive_schedule(
+        _derive_self(
+            spec_cost_model=_cost_model(
+                acceptance={"prior": 0.6, "self_correct_after_n_steps": 8}
+            )
+        )
+    )
+    assert without == with_knob
 
 
 def test_derive_mode_rejects_manual_schedule():
@@ -168,14 +232,26 @@ def test_derive_mode_requires_cost_model():
         SpeculativeConfig._derive_schedule(obj)
 
 
-def test_derive_mode_rejects_unknown_key():
-    obj = _derive_self(
-        spec_cost_model={
-            "acceptance": 0.6,
-            "bs_tiers": [[1, 64]],
-            "ctx_grid": [4000, 32000],
-            "bogus": 1,
-        }
-    )
-    with pytest.raises(ValueError, match="unknown keys"):
+def test_cost_model_config_rejects_unknown_key():
+    # The typed config forbids extra fields, so a typo fails at config time
+    # instead of being silently ignored.
+    with pytest.raises(ValueError):
+        SpecCostModelConfig(
+            acceptance=0.6,
+            bs_tiers=[(1, 64)],
+            ctx_grid=[4000, 32000],
+            bogus=1,
+        )
+
+
+def test_cost_model_config_requires_core_fields():
+    with pytest.raises(ValueError):
+        SpecCostModelConfig(acceptance=0.6, ctx_grid=[4000])
+
+
+def test_cost_model_config_bad_prior_surfaces_at_derive():
+    # Range semantics stay owned by CostModelParams; the config layer does not
+    # duplicate them, so the error surfaces when the model is built.
+    obj = _derive_self(spec_cost_model=_cost_model(acceptance=1.5))
+    with pytest.raises(ValueError, match="acceptance must be in"):
         SpeculativeConfig._derive_schedule(obj)
