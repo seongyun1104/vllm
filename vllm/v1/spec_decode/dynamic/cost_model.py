@@ -98,6 +98,29 @@ def _coarsen_to_budget(
         dense = [[lo if k == hi else k for k in row] for row in dense]
 
 
+def _drop_inert_ctx_boundaries(
+    ctx_lo: list[int], ctx_hi: list[int], dense: list[list[int]]
+) -> tuple[list[int], list[int], list[list[int]]]:
+    """Merge adjacent context buckets that no tier distinguishes.
+
+    Budget coarsening can equalise the K values on both sides of a boundary that
+    was justified before the merge. Such a boundary separates nothing: it costs a
+    lookup bucket and misreads as a K* transition. Dropping it keeps the emitted
+    boundaries exactly the ones the cost model still distinguishes."""
+    keep_lo = [ctx_lo[0]]
+    keep_hi: list[int] = []
+    columns = [[row[0]] for row in dense]
+    for c in range(1, len(ctx_lo)):
+        if all(row[c] == row[c - 1] for row in dense):
+            continue  # identical across every tier -> absorb into the previous bucket
+        keep_hi.append(ctx_hi[c - 1])
+        keep_lo.append(ctx_lo[c])
+        for t, row in enumerate(dense):
+            columns[t].append(row[c])
+    keep_hi.append(ctx_hi[-1])
+    return keep_lo, keep_hi, columns
+
+
 def derive_dynamic_sd_schedule(
     cost_params: CostModelParams,
     bs_tiers: list[tuple[int, int]],
@@ -166,6 +189,9 @@ def derive_dynamic_sd_schedule(
     ]
     if capture_budget is not None:
         dense = _coarsen_to_budget(dense, capture_budget)
+    ctx_lo_list, ctx_hi_list, dense = _drop_inert_ctx_boundaries(
+        ctx_lo_list, ctx_hi_list, dense
+    )
 
     schedule: DynamicSDSchedule = []
     for t, (bs_lo, bs_hi) in enumerate(tiers):
