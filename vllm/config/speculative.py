@@ -376,6 +376,74 @@ def _validate_qwen3_omni_dspark(
 
 
 @config
+class SpecAcceptancePrior:
+    """Draft-token acceptance prior for the Dynamic SD cost model.
+
+    A bare float is accepted and widened to ``{"prior": <value>}``, so the
+    scalar form stays valid while leaving room for the observed-acceptance
+    path without a schema change.
+    """
+
+    prior: float
+    """Expected per-position acceptance rate in ``(0, 1)``. Prefer a
+    conservative floor: overestimating raises K and pays the context tax the
+    schedule exists to avoid, while underestimating only forgoes some uplift."""
+
+    self_correct_after_n_steps: int = 0
+    """Reserved. Number of decode steps after which the prior would be replaced
+    by an observed estimate. Not consumed yet -- the schedule is derived once,
+    at startup."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _widen_scalar_prior(cls, data: Any) -> Any:
+        if isinstance(data, (int, float)) and not isinstance(data, bool):
+            return {"prior": data}
+        return data
+
+
+@config
+class SpecCostModelConfig:
+    """Inputs to the Dynamic SD cost model used when
+    ``spec_schedule_mode='derive'``.
+
+    Coefficient defaults are design-time references, not measurements; they must
+    be calibrated on the target hardware before any speedup is claimed. Value
+    ranges are enforced by ``CostModelParams`` and
+    ``derive_dynamic_sd_schedule``, which own the model semantics.
+    """
+
+    acceptance: SpecAcceptancePrior
+    """Acceptance prior; accepts a float or a ``SpecAcceptancePrior`` mapping."""
+
+    bs_tiers: list[tuple[int, int]]
+    """Non-overlapping ``(bs_lo, bs_hi)`` batch-size tiers; the first must start
+    at 1."""
+
+    ctx_grid: list[int]
+    """Candidate context-boundary points. K* is evaluated at each point and a
+    boundary is emitted only where K* changes, so the boundaries are derived
+    rather than typed."""
+
+    capture_budget: int | None = None
+    """Ceiling on the number of distinct K values, i.e. on the CUDA graphs the
+    schedule can require. Adjacent K values are merged until it is met."""
+
+    verify_fixed_base: float = 1.0
+    """Fixed per-step verify cost at ``ctx -> 0``."""
+
+    verify_fixed_per_ctx: float = 2.5e-4
+    """Growth of the fixed verify cost per context token. This is the term
+    through which context reaches K*."""
+
+    draft_marginal_base: float = 0.2
+    """Per-speculative-token cost at ``batch -> 0``."""
+
+    draft_marginal_per_bs: float = 0.02
+    """Growth of the per-speculative-token cost per unit batch size."""
+
+
+@config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 
@@ -500,15 +568,9 @@ class SpeculativeConfig:
     via ``vllm.v1.spec_decode.dynamic.cost_model``; the two are mutually
     exclusive."""
 
-    spec_cost_model: dict[str, Any] | None = None
-    """Cost-model inputs used when ``spec_schedule_mode='derive'``. Keys:
-    ``acceptance`` (float prior in ``(0, 1)``, or ``{"prior": float}`` for
-    forward compatibility), ``bs_tiers`` (list of ``[bs_lo, bs_hi]``, first
-    starting at 1), ``ctx_grid`` (ascending context points), ``capture_budget``
-    (optional distinct-K ceiling), and optional coefficient overrides
-    ``verify_fixed_base``, ``verify_fixed_per_ctx``, ``draft_marginal_base``,
-    ``draft_marginal_per_bs``. Coefficient defaults are design-time references
-    and should be calibrated on hardware before any speedup is claimed."""
+    spec_cost_model: SpecCostModelConfig | None = None
+    """Cost-model inputs used when ``spec_schedule_mode='derive'``. See
+    :class:`SpecCostModelConfig`; unknown keys are rejected."""
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -636,35 +698,21 @@ class SpeculativeConfig:
                 "spec_schedule_mode='derive' requires spec_cost_model."
             )
 
-        cm = dict(self.spec_cost_model)
-        acceptance = cm.pop("acceptance", None)
-        if acceptance is None:
-            raise ValueError("spec_cost_model requires 'acceptance'.")
-        if isinstance(acceptance, dict):
-            # ``self_correct_after_n_steps`` is a Layer-B knob, unused here.
-            acceptance = acceptance["prior"]
-        try:
-            bs_tiers = [tuple(t) for t in cm.pop("bs_tiers")]
-            ctx_grid = list(cm.pop("ctx_grid"))
-        except KeyError as exc:
-            raise ValueError(f"spec_cost_model missing key: {exc}") from exc
-        capture_budget = cm.pop("capture_budget", None)
+        cm = self.spec_cost_model
         params = CostModelParams(
-            acceptance=acceptance,
-            verify_fixed_base=cm.pop("verify_fixed_base", 1.0),
-            verify_fixed_per_ctx=cm.pop("verify_fixed_per_ctx", 2.5e-4),
-            draft_marginal_base=cm.pop("draft_marginal_base", 0.2),
-            draft_marginal_per_bs=cm.pop("draft_marginal_per_bs", 0.02),
+            acceptance=cm.acceptance.prior,
+            verify_fixed_base=cm.verify_fixed_base,
+            verify_fixed_per_ctx=cm.verify_fixed_per_ctx,
+            draft_marginal_base=cm.draft_marginal_base,
+            draft_marginal_per_bs=cm.draft_marginal_per_bs,
         )
-        if cm:
-            raise ValueError(f"spec_cost_model has unknown keys: {sorted(cm)}")
 
         return derive_dynamic_sd_schedule(
             params,
-            bs_tiers,
-            ctx_grid,
+            [tuple(tier) for tier in cm.bs_tiers],
+            list(cm.ctx_grid),
             max_k=self.num_speculative_tokens,
-            capture_budget=capture_budget,
+            capture_budget=cm.capture_budget,
         )
 
     draft_sample_method: DraftSampleMethod = "greedy"
